@@ -86,21 +86,6 @@ impl CopcInfoVlr {
             .try_for_each(|i| dst.write_u64::<LittleEndian>(i))?;
         Ok(())
     }
-    /// Parses the Hierarchy evlr
-    pub fn parse_hierarchy_evlr(&self, vlr: &Vlr) -> Result<CopcHierarchyVlr> {
-        let root = Page::read_from(vlr.data[0..self.root_hier_size as usize].as_ref())?;
-        let sub_pages = root
-            .entries
-            .iter()
-            .filter(|entry| entry.is_referencing_page())
-            .map(|entry| {
-                let start = (entry.offset - self.root_hier_offset) as usize;
-                let end = start + entry.byte_size as usize;
-                Page::read_from(vlr.data[start..end].as_ref()).map(|p| (entry.key, p))
-            })
-            .collect::<Result<HashMap<VoxelKey, Page>>>()?;
-        Ok(CopcHierarchyVlr { root, sub_pages })
-    }
 }
 
 impl TryFrom<&Vlr> for CopcInfoVlr {
@@ -266,8 +251,6 @@ impl Page {
 /// refers to a child hierarchy page, octree node data chunk, or an empty octree
 /// node. The size and file offset of each data chunk is provided in the hierarchy
 /// entries, allowing the chunks to be directly read for decoding.
-///
-/// TODO: The spec says one or more pages can be in a VLR ones without
 #[derive(Debug)]
 pub struct CopcHierarchyVlr {
     root: Page,
@@ -290,6 +273,21 @@ impl CopcHierarchyVlr {
         self.sub_pages
             .iter()
             .try_for_each(|(_, page)| page.write_to(dst))
+    }
+    /// Reads the CopcHierarchyVlr from the Vlr payload with specifications from copc_info
+    pub fn read_from_with(vlr: &Vlr, copc_info: &CopcInfoVlr) -> Result<CopcHierarchyVlr> {
+        let root = Page::read_from(vlr.data[0..copc_info.root_hier_size as usize].as_ref())?;
+        let sub_pages = root
+            .entries
+            .iter()
+            .filter(|entry| entry.is_referencing_page())
+            .map(|entry| {
+                let start = (entry.offset - copc_info.root_hier_offset) as usize;
+                let end = start + entry.byte_size as usize;
+                Page::read_from(vlr.data[start..end].as_ref()).map(|p| (entry.key, p))
+            })
+            .collect::<Result<HashMap<VoxelKey, Page>>>()?;
+        Ok(CopcHierarchyVlr { root, sub_pages })
     }
 }
 
@@ -351,7 +349,7 @@ impl Header {
             .iter()
             .find(|vlr| is_copchierarchy_evlr(vlr))
             .map_or(Err(Error::CopcHierarchyVlrNotFound), |vlr| {
-                copc_info.parse_hierarchy_evlr(vlr)
+                CopcHierarchyVlr::read_from_with(vlr, &copc_info)
             })
     }
 }
@@ -372,5 +370,20 @@ mod tests {
             .iter()
             .map(|c| (c, (0..8).map(|dir| c.child(dir)).collect::<Vec<_>>()))
             .all(|(p, childs)| childs.iter().all(|c| c.parent().eq(p))));
+    }
+
+    fn test_copc(path: &str) {
+        let reader = crate::Reader::from_path(path).expect("Cannot open reader");
+        let copcinfo = reader.header().copcinfo_vlr().unwrap();
+        let copchier = reader.header().copchierarchy_evlr().unwrap();
+        assert!(copcinfo.root_hier_offset == 4336);
+        assert!(copcinfo.root_hier_size == 32);
+        assert!(copchier.root.entries[0].key == VoxelKey::ROOT);
+        println!("{copcinfo:?}");
+        println!("{copchier:?}");
+    }
+    #[test]
+    fn test_copc_autzen() {
+        test_copc("tests/data/autzen.copc.laz");
     }
 }
